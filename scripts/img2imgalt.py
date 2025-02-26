@@ -11,9 +11,8 @@ from modules import processing, shared, sd_samplers, sd_samplers_common
 import torch
 import k_diffusion as K
 
-def find_noise_for_image(p, cond, uncond, cfg_scale, steps):
+def _run_noise_loop(p, cond, uncond, cfg_scale, steps, sigma_adjust):
     x = p.init_latent
-
     s_in = x.new_ones([x.shape[0]])
     if shared.sd_model.parameterization == "v":
         dnw = K.external.CompVisVDenoiser(shared.sd_model)
@@ -22,101 +21,62 @@ def find_noise_for_image(p, cond, uncond, cfg_scale, steps):
         dnw = K.external.CompVisDenoiser(shared.sd_model)
         skip = 0
     sigmas = dnw.get_sigmas(steps).flip(0)
-
     shared.state.sampling_steps = steps
-
     for i in trange(1, len(sigmas)):
         shared.state.sampling_step += 1
 
         x_in = torch.cat([x] * 2)
-        sigma_in = torch.cat([sigmas[i] * s_in] * 2)
-        cond_in = torch.cat([uncond, cond])
+        if sigma_adjust:
+            sigma_in = torch.cat([sigmas[i - 1] * s_in] * 2)
+            if i == 1:
+                t = dnw.sigma_to_t(torch.cat([sigmas[i] * s_in] * 2))
+            else:
+                t = dnw.sigma_to_t(sigma_in)
+        else:
+            sigma_in = torch.cat([sigmas[i] * s_in] * 2)
+            t = dnw.sigma_to_t(sigma_in)
 
+        cond_in = torch.cat([uncond, cond])
         image_conditioning = torch.cat([p.image_conditioning] * 2)
         cond_in = {"c_concat": [image_conditioning], "c_crossattn": [cond_in]}
-
         c_out, c_in = [K.utils.append_dims(k, x_in.ndim) for k in dnw.get_scalings(sigma_in)[skip:]]
-        t = dnw.sigma_to_t(sigma_in)
-
         eps = shared.sd_model.apply_model(x_in * c_in, t, cond=cond_in)
         denoised_uncond, denoised_cond = (x_in + eps * c_out).chunk(2)
 
         denoised = denoised_uncond + (denoised_cond - denoised_uncond) * cfg_scale
 
-        d = (x - denoised) / sigmas[i]
-        dt = sigmas[i] - sigmas[i - 1]
+        if sigma_adjust:
+            if i == 1:
+                d = (x - denoised) / (2 * sigmas[i])
+            else:
+                d = (x - denoised) / sigmas[i - 1]
+        else:
+            d = (x - denoised) / sigmas[i]
 
+        dt = sigmas[i] - sigmas[i - 1]
         x = x + d * dt
 
         sd_samplers_common.store_latent(x)
 
-        # This shouldn't be necessary, but solved some VRAM issues
-        del x_in, sigma_in, cond_in, c_out, c_in, t,
+        # This cleanup solved some VRAM issues
+        del x_in, sigma_in, cond_in, c_out, c_in, t
         del eps, denoised_uncond, denoised_cond, denoised, d, dt
 
     shared.state.nextjob()
 
-    return x / x.std()
+    if sigma_adjust:
+        return x / sigmas[-1]
+    else:
+        return x / x.std()
 
 
 Cached = namedtuple("Cached", ["noise", "cfg_scale", "steps", "latent", "original_prompt", "original_negative_prompt", "sigma_adjustment"])
 
+def find_noise_for_image(p, cond, uncond, cfg_scale, steps):
+    return _run_noise_loop(p, cond, uncond, cfg_scale, steps, sigma_adjust=False)
 
-# Based on changes suggested by briansemrau in https://github.com/AUTOMATIC1111/stable-diffusion-webui/issues/736
 def find_noise_for_image_sigma_adjustment(p, cond, uncond, cfg_scale, steps):
-    x = p.init_latent
-
-    s_in = x.new_ones([x.shape[0]])
-    if shared.sd_model.parameterization == "v":
-        dnw = K.external.CompVisVDenoiser(shared.sd_model)
-        skip = 1
-    else:
-        dnw = K.external.CompVisDenoiser(shared.sd_model)
-        skip = 0
-    sigmas = dnw.get_sigmas(steps).flip(0)
-
-    shared.state.sampling_steps = steps
-
-    for i in trange(1, len(sigmas)):
-        shared.state.sampling_step += 1
-
-        x_in = torch.cat([x] * 2)
-        sigma_in = torch.cat([sigmas[i - 1] * s_in] * 2)
-        cond_in = torch.cat([uncond, cond])
-
-        image_conditioning = torch.cat([p.image_conditioning] * 2)
-        cond_in = {"c_concat": [image_conditioning], "c_crossattn": [cond_in]}
-
-        c_out, c_in = [K.utils.append_dims(k, x_in.ndim) for k in dnw.get_scalings(sigma_in)[skip:]]
-
-        if i == 1:
-            t = dnw.sigma_to_t(torch.cat([sigmas[i] * s_in] * 2))
-        else:
-            t = dnw.sigma_to_t(sigma_in)
-
-        eps = shared.sd_model.apply_model(x_in * c_in, t, cond=cond_in)
-        denoised_uncond, denoised_cond = (x_in + eps * c_out).chunk(2)
-
-        denoised = denoised_uncond + (denoised_cond - denoised_uncond) * cfg_scale
-
-        if i == 1:
-            d = (x - denoised) / (2 * sigmas[i])
-        else:
-            d = (x - denoised) / sigmas[i - 1]
-
-        dt = sigmas[i] - sigmas[i - 1]
-        x = x + d * dt
-
-        sd_samplers_common.store_latent(x)
-
-        # This shouldn't be necessary, but solved some VRAM issues
-        del x_in, sigma_in, cond_in, c_out, c_in, t,
-        del eps, denoised_uncond, denoised_cond, denoised, d, dt
-
-    shared.state.nextjob()
-
-    return x / sigmas[-1]
-
+    return _run_noise_loop(p, cond, uncond, cfg_scale, steps, sigma_adjust=True)
 
 class Script(scripts.Script):
     def __init__(self):
